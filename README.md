@@ -169,6 +169,8 @@ For local Windows release builds, use the cached release builder:
 
 The script builds the real Tauri release binary plus the console CLI, verifies signed installer dependencies, packages with Inno Setup, writes installer/portable assets, writes SHA-256 sidecars, and can run a silent install/uninstall smoke test.
 
+See [Windows Portable release package](PORTABLE_RELEASE.md) for the one-command workflow, prerequisites, output paths, and checksum verification.
+
 More release automation notes live in [docs/release/ci-cd.md](docs/release/ci-cd.md).
 
 ## Privacy

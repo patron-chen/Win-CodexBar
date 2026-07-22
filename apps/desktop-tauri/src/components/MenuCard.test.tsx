@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const tauriMocks = vi.hoisted(() => ({
@@ -22,7 +22,7 @@ vi.mock("@tauri-apps/api/event", () => eventMocks);
 
 import { LocaleProvider } from "../i18n/LocaleProvider";
 import { buildBundle } from "../test/localeHarness";
-import type { ProviderUsageSnapshot } from "../types/bridge";
+import type { ProviderChartData, ProviderUsageSnapshot } from "../types/bridge";
 import MenuCard from "./MenuCard";
 
 function rateWindow(
@@ -81,7 +81,7 @@ function provider(
   };
 }
 
-function renderCard(
+function cardElement(
   snapshot: ProviderUsageSnapshot,
   opts: {
     showAsUsed?: boolean;
@@ -91,7 +91,7 @@ function renderCard(
     costSummaryDisplayStyle?: "compact" | "detailed" | "hidden";
   } = {},
 ) {
-  return render(
+  return (
     <LocaleProvider>
       <MenuCard
         provider={snapshot}
@@ -105,8 +105,49 @@ function renderCard(
         }}
         onLayoutChange={opts.onLayoutChange}
       />
-    </LocaleProvider>,
+    </LocaleProvider>
   );
+}
+
+function renderCard(
+  snapshot: ProviderUsageSnapshot,
+  opts: {
+    showAsUsed?: boolean;
+    showResetWhenExhausted?: boolean;
+    showPace?: boolean;
+    onLayoutChange?: () => void;
+    costSummaryDisplayStyle?: "compact" | "detailed" | "hidden";
+  } = {},
+) {
+  return render(cardElement(snapshot, opts));
+}
+
+function localUsageChart(todayCost: number, latestTokens: number): ProviderChartData {
+  return {
+    providerId: "claude",
+    costHistory: [],
+    creditsHistory: [],
+    usageBreakdown: [],
+    tokensHistory: [],
+    tokensIncomplete: false,
+    localUsage: {
+      todayCost,
+      thirtyDayCost: null,
+      thirtyDayTokens: null,
+      latestTokens,
+      topModel: "gpt-5",
+      estimateNote: "Estimated from local logs",
+      tokenCostUpdatedAtMs: Date.now(),
+    },
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 describe("MenuCard", () => {
@@ -577,6 +618,87 @@ describe("MenuCard", () => {
     const metrics = container.querySelector(".menu-card__metrics")!;
     expect(accounts.compareDocumentPosition(metrics) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(container.querySelector<HTMLDetailsElement>(".menu-card__more")?.open).toBe(false);
+  });
+
+  it("refreshes local usage with provider data while retaining the previous summary", async () => {
+    const refreshed = deferred<ProviderChartData>();
+    tauriMocks.getProviderChartData
+      .mockResolvedValueOnce(localUsageChart(1, 100))
+      .mockReturnValueOnce(refreshed.promise);
+
+    const initial = provider(null, 10);
+    const view = renderCard(initial);
+
+    expect(await screen.findByText("$1.00")).toBeInTheDocument();
+    expect(screen.getByText("100")).toBeInTheDocument();
+    expect(tauriMocks.getProviderChartData).toHaveBeenCalledTimes(1);
+
+    view.rerender(cardElement({ ...initial, primary: rateWindow(20) }));
+    expect(tauriMocks.getProviderChartData).toHaveBeenCalledTimes(1);
+
+    const next = {
+      ...initial,
+      primary: rateWindow(30),
+      updatedAt: "2026-05-24T00:01:00Z",
+    };
+    view.rerender(cardElement(next));
+
+    await waitFor(() => {
+      expect(tauriMocks.getProviderChartData).toHaveBeenCalledTimes(2);
+    });
+    expect(screen.getByText("$1.00")).toBeInTheDocument();
+    expect(screen.getByText("100")).toBeInTheDocument();
+
+    await act(async () => {
+      refreshed.resolve(localUsageChart(2, 200));
+      await refreshed.promise;
+    });
+
+    expect(await screen.findByText("$2.00")).toBeInTheDocument();
+    expect(screen.getByText("200")).toBeInTheDocument();
+    expect(screen.queryByText("$1.00")).not.toBeInTheDocument();
+  });
+
+  it("ignores an older local usage response after a newer provider refresh", async () => {
+    const older = deferred<ProviderChartData>();
+    const newer = deferred<ProviderChartData>();
+    tauriMocks.getProviderChartData
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise);
+
+    const initial = provider(null, 10);
+    const view = renderCard(initial);
+    await waitFor(() => {
+      expect(tauriMocks.getProviderChartData).toHaveBeenCalledTimes(1);
+    });
+
+    view.rerender(
+      cardElement({
+        ...initial,
+        primary: rateWindow(20),
+        updatedAt: "2026-05-24T00:01:00Z",
+      }),
+    );
+    await waitFor(() => {
+      expect(tauriMocks.getProviderChartData).toHaveBeenCalledTimes(2);
+    });
+
+    await act(async () => {
+      newer.resolve(localUsageChart(3, 300));
+      await newer.promise;
+    });
+    expect(await screen.findByText("$3.00")).toBeInTheDocument();
+    expect(screen.getByText("300")).toBeInTheDocument();
+
+    await act(async () => {
+      older.resolve(localUsageChart(1, 100));
+      await older.promise;
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("$1.00")).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("$3.00")).toBeInTheDocument();
+    expect(screen.getByText("300")).toBeInTheDocument();
   });
 
   it("shows on-pace budgets and expands projection details", async () => {

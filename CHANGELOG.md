@@ -285,6 +285,7 @@ macOS-only shell polish (menu-bar layout editor, widgets, full hooks UI chrome) 
 - OpenCode: do not rescale sub-1% computed usage to 100% (#211, #215 / upstream #2331).
 - Cursor: map Cli to web cookie path; clamp plan usage at 100% (#212, #217 / upstream #2255).
 - Cost scanner: process incomplete final JSONL lines for Claude transcripts.
+- Refresh local token totals and estimated daily cost with provider quota updates.
 
 ---
 

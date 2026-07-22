@@ -158,12 +158,15 @@ export default function MenuCard({
   }, [provider.providerId]);
 
   useEffect(() => {
+    setChartData(null);
+  }, [provider.providerId, provider.accountEmail]);
+
+  useEffect(() => {
     if (!providerSupportsChartData(provider.providerId)) {
       setChartData(null);
       return;
     }
     let cancelled = false;
-    setChartData(null);
     getProviderChartData(
       provider.providerId,
       provider.accountEmail ?? undefined,
@@ -180,7 +183,12 @@ export default function MenuCard({
     return () => {
       cancelled = true;
     };
-  }, [provider.providerId, provider.accountEmail, onLayoutChange]);
+  }, [
+    provider.providerId,
+    provider.accountEmail,
+    provider.updatedAt,
+    onLayoutChange,
+  ]);
 
   const isWayfinder = provider.providerId === "wayfinder";
   const email = !isWayfinder && provider.accountEmail
