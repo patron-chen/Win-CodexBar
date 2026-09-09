@@ -765,7 +765,8 @@ fn reasoning_survives_scan_rebuild_and_cache_reload() {
     assert!(loaded_row.len() >= 4);
     assert_eq!(loaded_row[3], 7);
     assert_eq!(
-        JsonlScanner::cached_cost_report_from_days(&loaded).reasoning_tokens,
+        JsonlScanner::cached_cost_report_from_days(&loaded, &CostUsageDayRange::new(today, today),)
+            .reasoning_tokens,
         Some(7)
     );
 
@@ -1968,6 +1969,8 @@ fn previous_report_clears_after_successful_full_scan() {
     // Inject a previous_report to simulate trim-set catch-up.
     let mut cache = JsonlScanner::load_cache(ProviderId::Codex, Some(&cache_root));
     cache.previous_report = Some(crate::core::CachedCostReport {
+        since_key: None,
+        until_key: None,
         total_cost_usd: 0.0,
         input_tokens: 0,
         cached_tokens: 0,
@@ -2151,7 +2154,11 @@ fn incomplete_summary_preserves_previous_report_and_marks_it_non_authoritative()
     let cache_root = root.path().join("cache");
     write_codex_session_fixture_with_inputs(&sessions, "multi.jsonl", &[100, 200]);
 
+    let today = Local::now().date_naive();
+    let range = CostUsageDayRange::new(today - Duration::days(6), today);
     let report = CachedCostReport {
+        since_key: Some(range.since_key),
+        until_key: Some(range.until_key),
         total_cost_usd: 42.5,
         input_tokens: 11,
         cached_tokens: 2,
@@ -2197,7 +2204,11 @@ fn failed_catch_up_pause_preserves_cursor_and_report_until_explicit_refresh() {
     let sessions = root.path().join("sessions");
     let cache_root = root.path().join("cache");
     let pending = write_codex_session_fixture(&sessions, "pending.jsonl", 100);
+    let today = Local::now().date_naive();
+    let range = CostUsageDayRange::new(today - Duration::days(6), today);
     let report = CachedCostReport {
+        since_key: Some(range.since_key),
+        until_key: Some(range.until_key),
         total_cost_usd: 42.5,
         input_tokens: 11,
         cached_tokens: 2,
@@ -2615,7 +2626,11 @@ fn paused_catch_up_round_trips_without_retrying_in_background() {
     let sessions = root.path().join("sessions");
     let cache_root = root.path().join("cache");
     let pending = write_codex_session_fixture(&sessions, "pending.jsonl", 100);
+    let today = Local::now().date_naive();
+    let range = CostUsageDayRange::new(today - Duration::days(6), today);
     let report = CachedCostReport {
+        since_key: Some(range.since_key),
+        until_key: Some(range.until_key),
         total_cost_usd: 9.25,
         input_tokens: 21,
         cached_tokens: 1,
@@ -2656,6 +2671,131 @@ fn paused_catch_up_round_trips_without_retrying_in_background() {
         Some(report.total_cost_usd)
     );
     assert_eq!(saved.codex_scan_pause_reason, cache.codex_scan_pause_reason);
+}
+
+#[test]
+fn paused_report_is_only_reused_for_its_exact_window() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let cache_root = root.path().join("cache");
+    std::fs::create_dir_all(&sessions).unwrap();
+
+    let today = Local::now().date_naive();
+    let today_key = CostUsageDayRange::day_key(today);
+    let old_key = CostUsageDayRange::day_key(today - Duration::days(40));
+    let thirty_day_range = CostUsageDayRange::new(today - Duration::days(29), today);
+    let report = CachedCostReport {
+        since_key: Some(thirty_day_range.since_key.clone()),
+        until_key: Some(thirty_day_range.until_key.clone()),
+        total_cost_usd: 999.0,
+        input_tokens: 1_000_000_000,
+        cached_tokens: 900_000_000,
+        output_tokens: 100_000_000,
+        reasoning_tokens: None,
+        sessions_count: 99,
+        updated_at: Some("2026-09-06T00:00:00Z".to_string()),
+        partial: false,
+    };
+    let mut cache = CostUsageCache {
+        days: HashMap::from([
+            (
+                today_key.clone(),
+                HashMap::from([("gpt-5.6-sol".to_string(), vec![100, 80, 10])]),
+            ),
+            (
+                old_key.clone(),
+                HashMap::from([(
+                    "gpt-6-astra".to_string(),
+                    vec![1_000_000_000, 900_000_000, 100_000_000],
+                )]),
+            ),
+        ]),
+        files: HashMap::from([
+            (
+                "today.jsonl".to_string(),
+                cached_usage_with_packed(&today_key, "gpt-5.6-sol", vec![100, 80, 10]),
+            ),
+            (
+                "old.jsonl".to_string(),
+                cached_usage_with_packed(
+                    &old_key,
+                    "gpt-6-astra",
+                    vec![1_000_000_000, 900_000_000, 100_000_000],
+                ),
+            ),
+        ]),
+        previous_report: Some(report.clone()),
+        codex_scan_incomplete: true,
+        codex_scan_pause_reason: Some(CodexScanPauseReason::NoProgress),
+        ..Default::default()
+    };
+    JsonlScanner::save_cache(ProviderId::Codex, &mut cache, Some(&cache_root));
+
+    let thirty_day = CostScanner::new(30)
+        .with_cache_root(&cache_root)
+        .with_sessions_dirs(vec![sessions.clone()])
+        .scan_codex();
+    assert_eq!(thirty_day.input_tokens, report.input_tokens as u64);
+    assert_eq!(thirty_day.output_tokens, report.output_tokens as u64);
+
+    let one_day = CostScanner::new(1)
+        .with_cache_root(&cache_root)
+        .with_sessions_dirs(vec![sessions])
+        .scan_codex();
+    assert_eq!(one_day.input_tokens, 100);
+    assert_eq!(one_day.cached_tokens, 80);
+    assert_eq!(one_day.output_tokens, 10);
+    assert_eq!(one_day.sessions_count, 1);
+    assert_eq!(one_day.by_model_tokens["gpt-5.6-sol"].input_tokens, 100);
+    assert_eq!(one_day.by_model_tokens["gpt-5.6-sol"].cached_tokens, 80);
+    assert_eq!(one_day.by_model_tokens["gpt-5.6-sol"].output_tokens, 10);
+    assert!(!one_day.by_model_tokens.contains_key("gpt-6-astra"));
+    let expected_cost =
+        crate::core::CostUsagePricing::codex_cost_usd_at_date("gpt-5.6-sol", 100, 80, 10, today)
+            .unwrap();
+    assert!((one_day.total_cost_usd - expected_cost).abs() < f64::EPSILON);
+    assert!(!one_day.history_coverage_established);
+}
+
+#[test]
+fn legacy_paused_report_without_window_rebuilds_requested_range() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let cache_root = root.path().join("cache");
+    std::fs::create_dir_all(&sessions).unwrap();
+
+    let today = Local::now().date_naive();
+    let mut cache = CostUsageCache {
+        days: HashMap::from([(
+            CostUsageDayRange::day_key(today),
+            HashMap::from([("gpt-5.6-sol".to_string(), vec![50, 40, 5])]),
+        )]),
+        previous_report: Some(CachedCostReport {
+            since_key: None,
+            until_key: None,
+            total_cost_usd: 999.0,
+            input_tokens: 1_000_000_000,
+            cached_tokens: 900_000_000,
+            output_tokens: 100_000_000,
+            reasoning_tokens: None,
+            sessions_count: 99,
+            updated_at: None,
+            partial: false,
+        }),
+        codex_scan_incomplete: true,
+        codex_scan_pause_reason: Some(CodexScanPauseReason::NoProgress),
+        ..Default::default()
+    };
+    JsonlScanner::save_cache(ProviderId::Codex, &mut cache, Some(&cache_root));
+
+    let summary = CostScanner::new(1)
+        .with_cache_root(&cache_root)
+        .with_sessions_dirs(vec![sessions])
+        .scan_codex();
+    assert_eq!(summary.input_tokens, 50);
+    assert_eq!(summary.cached_tokens, 40);
+    assert_eq!(summary.output_tokens, 5);
+    assert!(!summary.history_coverage_established);
 }
 
 #[test]
@@ -2770,6 +2910,46 @@ fn complete_empty_codex_fragment_reparses_from_start_after_growth() {
     assert_eq!(grown_summary.input_tokens, 100);
     assert_eq!(stats.files_resumed, 0);
     assert!(!grown_cache.files[&key].days.is_empty());
+}
+
+#[test]
+fn explicit_wide_refresh_updates_today_before_debounced_one_day_summary() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let cache_root = root.path().join("cache");
+    write_codex_session_fixture_with_inputs(&sessions, "today.jsonl", &[100]);
+
+    let initial = CostScanner::new(30)
+        .with_options(CostScanOptions::app_driven())
+        .with_cache_root(&cache_root)
+        .with_sessions_dirs(vec![sessions.clone()]);
+    let (initial_summary, _, _) = initial.scan_codex_detailed_with_cache(None);
+    assert_eq!(initial_summary.input_tokens, 100);
+
+    write_codex_session_fixture_with_inputs(&sessions, "today.jsonl", &[100, 300]);
+
+    let background = CostScanner::new(30)
+        .with_cache_root(&cache_root)
+        .with_sessions_dirs(vec![sessions.clone()]);
+    let (debounced_summary, debounced_stats, _) = background.scan_codex_detailed_with_cache(None);
+    assert!(debounced_stats.used_cache_debounce);
+    assert_eq!(debounced_summary.input_tokens, 100);
+
+    let refreshed = CostScanner::new(30)
+        .with_options(CostScanOptions::app_driven())
+        .with_cache_root(&cache_root)
+        .with_sessions_dirs(vec![sessions.clone()]);
+    let (refreshed_summary, refreshed_stats, _) = refreshed.scan_codex_detailed_with_cache(None);
+    assert!(!refreshed_stats.used_cache_debounce);
+    assert_eq!(refreshed_summary.input_tokens, 300);
+
+    let today = CostScanner::new(1)
+        .with_cache_root(&cache_root)
+        .with_sessions_dirs(vec![sessions]);
+    let (today_summary, today_stats, _) = today.scan_codex_detailed_with_cache(None);
+    assert!(today_stats.used_cache_debounce);
+    assert_eq!(today_summary.input_tokens, 300);
+    assert_eq!(today_summary.sessions_count, 1);
 }
 
 #[test]

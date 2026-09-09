@@ -2,14 +2,19 @@ use super::*;
 
 pub(super) fn paused_codex_summary(
     cache: &CostUsageCache,
+    range: &CostUsageDayRange,
     start_date: NaiveDate,
-    today: NaiveDate,
+    end_date: NaiveDate,
 ) -> CostSummary {
-    let report = cache
+    if let Some(report) = cache
         .previous_report
-        .clone()
-        .unwrap_or_else(|| JsonlScanner::cached_cost_report_from_days(cache));
-    summary_from_cached_report(&report, start_date, today)
+        .as_ref()
+        .filter(|report| cached_report_matches_range(report, range))
+    {
+        summary_from_cached_report(report, start_date, end_date)
+    } else {
+        summary_from_cached_days(cache, range, start_date, end_date)
+    }
 }
 
 /// Return cached Codex files that are provably gone from the portion of the

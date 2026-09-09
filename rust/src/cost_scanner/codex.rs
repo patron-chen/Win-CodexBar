@@ -37,6 +37,39 @@ fn summary_from_cached_report(
     }
 }
 
+fn cached_report_matches_range(report: &CachedCostReport, range: &CostUsageDayRange) -> bool {
+    report.since_key.as_deref() == Some(range.since_key.as_str())
+        && report.until_key.as_deref() == Some(range.until_key.as_str())
+}
+
+fn summary_from_cached_days(
+    cache: &CostUsageCache,
+    range: &CostUsageDayRange,
+    period_start: NaiveDate,
+    period_end: NaiveDate,
+) -> CostSummary {
+    let mut summary = CostSummary {
+        period_start: Some(period_start),
+        period_end: Some(period_end),
+        ..CostSummary::default()
+    };
+    let (cost, _) = add_codex_days_map_to_summary(&mut summary, &cache.days, range);
+    summary.total_cost_usd += cost;
+    #[allow(clippy::cast_possible_truncation, reason = "cache file counts fit u32")]
+    {
+        summary.sessions_count = cache
+            .files
+            .values()
+            .filter(|usage| {
+                usage.days.keys().any(|day| {
+                    CostUsageDayRange::is_in_range(day, &range.since_key, &range.until_key)
+                })
+            })
+            .count() as u32;
+    }
+    summary
+}
+
 fn codex_fork_parent_is_safe(cache: &CostUsageCache, usage: &CostUsageFileUsage) -> bool {
     usage.codex_forked_from_id.as_deref().is_none()
         || codex_parent_baseline(
@@ -179,7 +212,7 @@ impl CostScanner {
         // intact until the user explicitly requests an app-driven refresh.
         if pending_scan.should_preserve_pause(&cache, self.options.is_app_driven()) {
             return (
-                paused_codex_summary(&cache, start_date, today),
+                paused_codex_summary(&cache, &range, start_date, today),
                 stats,
                 cache,
             );
@@ -244,7 +277,11 @@ impl CostScanner {
             && (cache.scan_since_key.is_some()
                 || !cache.days.is_empty()
                 || !cache.files.is_empty()))
-        .then(|| JsonlScanner::cached_cost_report_from_days(&cache));
+        .then(|| JsonlScanner::completed_report_range(&cache))
+        .flatten()
+        .map(|established_range| {
+            JsonlScanner::cached_cost_report_from_days(&cache, &established_range)
+        });
 
         // Persist the source-bound work range before doing bounded work.
         cache.codex_pending_scan_since_key = Some(scan_range.scan_since_key.clone());
@@ -439,30 +476,14 @@ impl CostScanner {
                 .retain(|path, _| Path::new(path).exists());
             rebuild_cache_days(&mut summary_cache);
         }
-        let mut rebuilt = CostSummary {
-            period_start: Some(start_date),
-            period_end: Some(today),
-            ..CostSummary::default()
-        };
-        let (native_cost, _) =
-            add_codex_days_map_to_summary(&mut rebuilt, &summary_cache.days, &range);
-        rebuilt.total_cost_usd += native_cost;
-        #[allow(clippy::cast_possible_truncation, reason = "cache file counts fit u32")]
-        {
-            rebuilt.sessions_count = summary_cache
-                .files
-                .values()
-                .filter(|usage| {
-                    usage.days.keys().any(|day| {
-                        CostUsageDayRange::is_in_range(day, &range.since_key, &range.until_key)
-                    })
-                })
-                .count() as u32;
-        }
+        let rebuilt = summary_from_cached_days(&summary_cache, &range, start_date, today);
         let cancelled_with_missing_cache_rows =
             is_cancelled(cancel) && cache.files.keys().any(|path| !Path::new(path).exists());
         let preserving_previous_report = cache.codex_scan_incomplete
-            && cache.previous_report.is_some()
+            && cache
+                .previous_report
+                .as_ref()
+                .is_some_and(|report| cached_report_matches_range(report, &range))
             && !cancelled_with_missing_cache_rows;
         summary = if preserving_previous_report {
             cache

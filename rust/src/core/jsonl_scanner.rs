@@ -311,6 +311,12 @@ pub struct CodexTotals {
 /// for the save/load overshoot contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedCostReport {
+    /// Inclusive first day represented by this report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_key: Option<String>,
+    /// Inclusive last day represented by this report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_key: Option<String>,
     /// Total cost in USD for the reported window.
     pub total_cost_usd: f64,
     /// Total input tokens.
@@ -402,6 +408,14 @@ impl CostUsageDayRange {
 
     pub fn parse_day_key(key: &str) -> Option<NaiveDate> {
         NaiveDate::parse_from_str(key, "%Y-%m-%d").ok()
+    }
+
+    fn from_scan_bounds(scan_since_key: &str, scan_until_key: &str) -> Option<Self> {
+        let since =
+            Self::parse_day_key(scan_since_key)?.checked_add_signed(chrono::Duration::days(1))?;
+        let until =
+            Self::parse_day_key(scan_until_key)?.checked_sub_signed(chrono::Duration::days(1))?;
+        (since <= until).then(|| Self::new(since, until))
     }
 }
 
@@ -500,7 +514,10 @@ impl JsonlScanner {
             codex_scan_pause_reason: projection.codex_scan_pause_reason,
         }
     }
-    pub(crate) fn cached_cost_report_from_days(cache: &CostUsageCache) -> CachedCostReport {
+    pub(crate) fn cached_cost_report_from_days(
+        cache: &CostUsageCache,
+        range: &CostUsageDayRange,
+    ) -> CachedCostReport {
         let mut total_cost_usd = 0.0;
         let mut input_tokens = 0_i64;
         let mut cached_tokens = 0_i64;
@@ -510,6 +527,9 @@ impl JsonlScanner {
         let mut partial = false;
 
         for (day_key, models) in &cache.days {
+            if !CostUsageDayRange::is_in_range(day_key, &range.since_key, &range.until_key) {
+                continue;
+            }
             let pricing_day = NaiveDate::parse_from_str(day_key, "%Y-%m-%d").ok();
             for (model, values) in models {
                 let input = values.first().copied().unwrap_or(0).max(0);
@@ -564,11 +584,17 @@ impl JsonlScanner {
             cache
                 .files
                 .values()
-                .filter(|usage| !usage.days.is_empty())
+                .filter(|usage| {
+                    usage.days.keys().any(|day| {
+                        CostUsageDayRange::is_in_range(day, &range.since_key, &range.until_key)
+                    })
+                })
                 .count(),
         )
         .unwrap_or(i32::MAX);
         CachedCostReport {
+            since_key: Some(range.since_key.clone()),
+            until_key: Some(range.until_key.clone()),
             total_cost_usd,
             input_tokens,
             cached_tokens,
@@ -578,6 +604,13 @@ impl JsonlScanner {
             updated_at: Some(Utc::now().to_rfc3339()),
             partial,
         }
+    }
+
+    pub(crate) fn completed_report_range(cache: &CostUsageCache) -> Option<CostUsageDayRange> {
+        CostUsageDayRange::from_scan_bounds(
+            cache.scan_since_key.as_deref()?,
+            cache.scan_until_key.as_deref()?,
+        )
     }
 
     /// Merge one Codex record into a packed day/model row. A three-slot row is
@@ -656,10 +689,10 @@ impl JsonlScanner {
             // pruning. If budget trimming creates a catch-up cycle, this is the
             // established spend/tokens users should keep seeing until replacement
             // history finishes, not a zero-cost reconstruction of the trimmed cache.
-            let established_report = cache
-                .previous_report
-                .clone()
-                .unwrap_or_else(|| Self::cached_cost_report_from_days(cache));
+            let established_report = cache.previous_report.clone().or_else(|| {
+                Self::completed_report_range(cache)
+                    .map(|range| Self::cached_cost_report_from_days(cache, &range))
+            });
             let pruned = crate::core::prune_out_of_window_for_budget(
                 &mut cache.files,
                 &mut cache.days,
@@ -684,7 +717,7 @@ impl JsonlScanner {
             // next refresh can signal catch-up is pending (and spend surfaces can show
             // the last-validated snapshot during the rescan).
             if (!pruned.is_empty() || !trimmed.is_empty()) && cache.previous_report.is_none() {
-                cache.previous_report = Some(established_report);
+                cache.previous_report = established_report;
             }
         }
 

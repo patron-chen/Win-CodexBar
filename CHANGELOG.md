@@ -25,6 +25,11 @@ Windows port of upstream CodexBar **0.56.8 → 0.60.3**.
 
 ---
 
+### Fixed
+- Codex local token and cost summaries now keep daily, 7-day, and 30-day cache windows isolated while history catch-up is paused.
+- Desktop token and cost refreshes now rescan growing Codex rollouts before deriving Today and Latest tokens.
+- Local token and cost totals now remain visible outside the collapsed Usage details section.
+
 ## [Windows] 0.56.8 - 2026-09-08
 
 Windows release aligned to the reviewed upstream CodexBar **0.56.8** behavior baseline, plus Windows-specific reliability, account-switching, UI, browser-import, and release-pipeline improvements landed since 0.55.0.

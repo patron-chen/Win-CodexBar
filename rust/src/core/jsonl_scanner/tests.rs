@@ -12,6 +12,11 @@ fn test_day_range() {
     assert_eq!(range.until_key, "2026-01-20");
     assert_eq!(range.scan_since_key, "2026-01-14");
     assert_eq!(range.scan_until_key, "2026-01-21");
+
+    let restored =
+        CostUsageDayRange::from_scan_bounds(&range.scan_since_key, &range.scan_until_key).unwrap();
+    assert_eq!(restored.since_key, range.since_key);
+    assert_eq!(restored.until_key, range.until_key);
 }
 
 #[test]
@@ -231,7 +236,11 @@ fn legacy_packed_rows_remain_three_slots_and_report_reasoning_is_unknown() {
         "2026-05-31".to_string(),
         HashMap::from([("gpt-5.6-sol".to_string(), packed)]),
     );
-    let report = JsonlScanner::cached_cost_report_from_days(&cache);
+    let range = CostUsageDayRange::new(
+        NaiveDate::from_ymd_opt(2026, 5, 31).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 5, 31).unwrap(),
+    );
+    let report = JsonlScanner::cached_cost_report_from_days(&cache, &range);
     assert_eq!(report.reasoning_tokens, None);
 }
 
@@ -242,8 +251,12 @@ fn known_packed_rows_report_reasoning_only_when_all_token_rows_are_known() {
         "2026-05-31".to_string(),
         HashMap::from([("gpt-5.6-sol".to_string(), vec![10, 2, 4, 3])]),
     );
+    let range = CostUsageDayRange::new(
+        NaiveDate::from_ymd_opt(2026, 5, 31).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 5, 31).unwrap(),
+    );
     assert_eq!(
-        JsonlScanner::cached_cost_report_from_days(&cache).reasoning_tokens,
+        JsonlScanner::cached_cost_report_from_days(&cache, &range).reasoning_tokens,
         Some(3)
     );
 
@@ -253,7 +266,7 @@ fn known_packed_rows_report_reasoning_only_when_all_token_rows_are_known() {
         .unwrap()
         .insert("gpt-5.6-fast".to_string(), vec![1, 0, 1]);
     assert_eq!(
-        JsonlScanner::cached_cost_report_from_days(&cache).reasoning_tokens,
+        JsonlScanner::cached_cost_report_from_days(&cache, &range).reasoning_tokens,
         None
     );
 }
@@ -1071,6 +1084,8 @@ fn legacy_file_usage_json_defaults_fork_metadata() {
         r#"{"total_cost_usd":1.5,"input_tokens":10,"cached_tokens":2,"output_tokens":3,"sessions_count":1,"updated_at":null,"partial":false}"#,
     )
     .unwrap();
+    assert_eq!(report.since_key, None);
+    assert_eq!(report.until_key, None);
     assert_eq!(report.reasoning_tokens, None);
 }
 
@@ -1180,8 +1195,19 @@ fn catch_up_snapshot_preserves_established_codex_cost_and_tokens() {
         "2026-08-20".to_string(),
         HashMap::from([("gpt-5.6-sol".to_string(), vec![1_000, 250, 100])]),
     );
+    cache.days.insert(
+        "2026-07-01".to_string(),
+        HashMap::from([(
+            "gpt-5.6-sol".to_string(),
+            vec![1_000_000_000, 900_000_000, 100_000_000],
+        )]),
+    );
 
-    let report = JsonlScanner::cached_cost_report_from_days(&cache);
+    let range = CostUsageDayRange::new(
+        NaiveDate::from_ymd_opt(2026, 8, 20).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 8, 20).unwrap(),
+    );
+    let report = JsonlScanner::cached_cost_report_from_days(&cache, &range);
     let expected = CostUsagePricing::codex_cost_usd_at_date(
         "gpt-5.6-sol",
         1_000,
@@ -1197,6 +1223,8 @@ fn catch_up_snapshot_preserves_established_codex_cost_and_tokens() {
     assert_eq!(report.cached_tokens, 250);
     assert_eq!(report.output_tokens, 100);
     assert_eq!(report.sessions_count, 1);
+    assert_eq!(report.since_key.as_deref(), Some("2026-08-20"));
+    assert_eq!(report.until_key.as_deref(), Some("2026-08-20"));
     assert!(!report.partial);
     assert!(report.updated_at.is_some());
 }
